@@ -23,6 +23,7 @@ vcpkg_from_gitlab(
         fix-bz2-windows-debug-dependency.patch
         base-must-be-enabled.patch
         no-downloads.patch
+        tsdemux-support-sync-klv.patch
         ${PATCHES}
 )
 

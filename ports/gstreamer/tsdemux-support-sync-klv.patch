@@ -1,0 +1,852 @@
+From 4e14bac1ff0d6bcd696d572e19090bc544dc767e Mon Sep 17 00:00:00 2001
+From: Brad Hards <bradh@frogmouth.net>
+Date: Thu, 30 Mar 2023 20:06:33 +1100
+Subject: [PATCH 1/2] mpegts: implement metadata in PES packets
+
+Co-authored-by: Andoni Morales Alastruey <ylatuya@gmail.com>
+Part-of: <https://gitlab.freedesktop.org/gstreamer/gstreamer/-/merge_requests/1312>
+---
+ .../gst/mpegts/gst-metadata-descriptor.c      | 137 ++++++++++++++++++
+ .../gst/mpegts/gst-metadata-descriptor.h      | 116 +++++++++++++++
+ .../gst/mpegts/gst-mpegtspesmetadatameta.c    | 106 ++++++++++++++
+ .../gst/mpegts/gst-mpegtspesmetadatameta.h    | 108 ++++++++++++++
+ .../gst-libs/gst/mpegts/gstmpegtsdescriptor.h |   8 +
+ .../gst-libs/gst/mpegts/meson.build           |   4 +
+ .../gst-libs/gst/mpegts/mpegts.h              |   1 +
+ .../gst-plugins-bad/gst/mpegtsdemux/tsdemux.c |  73 ++++++++++
+ .../tests/examples/mpegts/ts-parser.c         |  43 ++++++
+ 9 files changed, 596 insertions(+)
+ create mode 100644 subprojects/gst-plugins-bad/gst-libs/gst/mpegts/gst-metadata-descriptor.c
+ create mode 100644 subprojects/gst-plugins-bad/gst-libs/gst/mpegts/gst-metadata-descriptor.h
+ create mode 100644 subprojects/gst-plugins-bad/gst-libs/gst/mpegts/gst-mpegtspesmetadatameta.c
+ create mode 100644 subprojects/gst-plugins-bad/gst-libs/gst/mpegts/gst-mpegtspesmetadatameta.h
+
+diff --git a/subprojects/gst-plugins-bad/gst-libs/gst/mpegts/gst-metadata-descriptor.c b/subprojects/gst-plugins-bad/gst-libs/gst/mpegts/gst-metadata-descriptor.c
+new file mode 100644
+index 00000000000..0652a592d50
+--- /dev/null
++++ b/subprojects/gst-plugins-bad/gst-libs/gst/mpegts/gst-metadata-descriptor.c
+@@ -0,0 +1,137 @@
++/* Gstreamer
++ * Copyright 2023 Brad Hards <bradh@frogmouth.net>
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Library General Public
++ * License as published by the Free Software Foundation; either
++ * version 2 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Library General Public License for more details.
++ *
++ * You should have received a copy of the GNU Library General Public
++ * License along with this library; if not, write to the
++ * Free Software Foundation, Inc., 59 Temple Place - Suite 330,
++ * Boston, MA 02111-1307, USA.
++ */
++
++#ifdef HAVE_CONFIG_H
++#include "config.h"
++#endif
++
++#include "mpegts.h"
++#include "gstmpegts-private.h"
++
++#define GST_CAT_DEFAULT mpegts_debug
++
++static GstMpegtsMetadataDescriptor
++    * _gst_mpegts_metadata_descriptor_copy
++    (GstMpegtsMetadataDescriptor * source)
++{
++  GstMpegtsMetadataDescriptor *copy =
++      g_memdup2 (source, sizeof (GstMpegtsMetadataDescriptor));
++  return copy;
++}
++
++static void
++_gst_mpegts_metadata_descriptor_free (GstMpegtsMetadataDescriptor * desc)
++{
++  g_free (desc);
++}
++
++G_DEFINE_BOXED_TYPE (GstMpegtsMetadataDescriptor,
++    gst_mpegts_metadata_descriptor,
++    (GBoxedCopyFunc) _gst_mpegts_metadata_descriptor_copy,
++    (GFreeFunc) _gst_mpegts_metadata_descriptor_free);
++
++/**
++ * gst_mpegts_descriptor_parse_metadata:
++ * @descriptor: a %GST_TYPE_MPEGTS_METADATA_DESCRIPTOR #GstMpegtsDescriptor
++ * @res: (out) (transfer full): #GstMpegtsMetadataDescriptor
++ *
++ * Parses out the metadata descriptor from the @descriptor.
++ *
++ * See ISO/IEC 13818-1:2018 Section 2.6.60 and 2.6.61 for details.
++ * metadata_application_format is provided in Table 2-82. metadata_format is
++ * provided in Table 2-85.
++ *
++ * Returns: %TRUE if the parsing worked correctly, else %FALSE.
++ *
++ * Since: 1.24
++ */
++gboolean
++gst_mpegts_descriptor_parse_metadata (const GstMpegtsDescriptor * descriptor,
++    GstMpegtsMetadataDescriptor ** desc)
++{
++  guint8 *data;
++  guint8 flag;
++  GstMpegtsMetadataDescriptor *res;
++
++  g_return_val_if_fail (descriptor != NULL && desc != NULL, FALSE);
++  __common_desc_checks (descriptor, GST_MTS_DESC_METADATA, 5, FALSE);
++
++  data = (guint8 *) descriptor->data + 2;
++
++  res = g_new0 (GstMpegtsMetadataDescriptor, 1);
++
++  res->metadata_application_format = GST_READ_UINT16_BE (data);
++  data += 2;
++  if (res->metadata_application_format == 0xFFFF) {
++    // skip over metadata_application_format_identifier if it is provided
++    data += 4;
++  }
++  res->metadata_format = *data;
++  data += 1;
++  if (res->metadata_format == GST_MPEGTS_METADATA_FORMAT_IDENTIFIER_FIELD) {
++    res->metadata_format_identifier = GST_READ_UINT32_BE (data);
++    data += 4;
++  }
++  res->metadata_service_id = *data;
++  data += 1;
++  flag = *data;
++  res->decoder_config_flags = flag >> 5;
++  res->dsm_cc_flag = (flag & 0x10);
++
++  // There are more values if the dsm_cc_flag or decoder flags are set.
++
++  *desc = res;
++
++  return TRUE;
++}
++
++/**
++ * gst_mpegts_descriptor_parse_metadata_std:
++ * @descriptor: a %GST_MTS_DESC_METADATA_STD #GstMpegtsDescriptor
++ * @metadata_input_leak_rate (out): the input leak rate in units of 400bits/sec.
++ * @metadata_buffer_size (out): the buffer size in units of 1024 bytes
++ * @metadata_output_leak_rate (out): the output leak rate in units of 400bits/sec.
++ *
++ * Extracts the metadata STD descriptor from @descriptor.
++ *
++ * See ISO/IEC 13818-1:2018 Section 2.6.62 and 2.6.63 for details.
++ *
++ * Returns: %TRUE if parsing succeeded, else %FALSE.
++ *
++ * Since: 1.24
++ */
++gboolean
++gst_mpegts_descriptor_parse_metadata_std (const GstMpegtsDescriptor *
++    descriptor, guint32 * metadata_input_leak_rate,
++    guint32 * metadata_buffer_size, guint32 * metadata_output_leak_rate)
++{
++  guint8 *data;
++
++  g_return_val_if_fail (descriptor != NULL && metadata_input_leak_rate != NULL
++      && metadata_buffer_size != NULL
++      && metadata_output_leak_rate != NULL, FALSE);
++  __common_desc_checks (descriptor, GST_MTS_DESC_METADATA_STD, 9, FALSE);
++  data = (guint8 *) descriptor->data + 2;
++  *metadata_input_leak_rate = GST_READ_UINT24_BE (data) & 0x3FFFFF;
++  data += 3;
++  *metadata_buffer_size = GST_READ_UINT24_BE (data) & 0x3FFFFF;
++  data += 3;
++  *metadata_output_leak_rate = GST_READ_UINT24_BE (data) & 0x3FFFFF;
++  return TRUE;
++}
+diff --git a/subprojects/gst-plugins-bad/gst-libs/gst/mpegts/gst-metadata-descriptor.h b/subprojects/gst-plugins-bad/gst-libs/gst/mpegts/gst-metadata-descriptor.h
+new file mode 100644
+index 00000000000..acbe497cdf0
+--- /dev/null
++++ b/subprojects/gst-plugins-bad/gst-libs/gst/mpegts/gst-metadata-descriptor.h
+@@ -0,0 +1,116 @@
++/* Gstreamer
++ * Copyright 2023 Brad Hards <bradh@frogmouth.net>
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Library General Public
++ * License as published by the Free Software Foundation; either
++ * version 2 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Library General Public License for more details.
++ *
++ * You should have received a copy of the GNU Library General Public
++ * License along with this library; if not, write to the
++ * Free Software Foundation, Inc., 59 Temple Place - Suite 330,
++ * Boston, MA 02111-1307, USA.
++ */
++
++#ifndef __GST_MPEGTS_METADATA_DESCRIPTOR_H__
++#define __GST_MPEGTS_METADATA_DESCRIPTOR_H__
++
++#include <gst/gst.h>
++#include <gst/mpegts/mpegts-prelude.h>
++
++G_BEGIN_DECLS
++
++/**
++ * GstMpegtsMetadataFormat:
++ *
++ * metadata_descriptor metadata_format valid values. See ISO/IEC 13818-1:2018(E) Table 2-85.
++ *
++ * Since: 1.24
++ */
++typedef enum {
++  /**
++   * GST_MPEGTS_METADATA_FORMAT_TEM:
++   *
++   * ISO/IEC 15938-1 TeM.
++   *
++   * Since: 1.24
++   */
++  GST_MPEGTS_METADATA_FORMAT_TEM = 0x10,
++  /**
++   * GST_MPEGTS_METADATA_FORMAT_BIM:
++   *
++   * ISO/IEC 15938-1 BiM.
++   *
++   * Since: 1.24
++   */
++  GST_MPEGTS_METADATA_FORMAT_BIM = 0x11,
++  /**
++   * GST_MPEGTS_METADATA_FORMAT_APPLICATION_FORMAT:
++   *
++   * Defined by metadata application format.
++   *
++   * Since: 1.24
++   */
++  GST_MPEGTS_METADATA_FORMAT_APPLICATION_FORMAT = 0x3f,
++  /**
++   * GST_MPEGTS_METADATA_FORMAT_IDENTIFIER_FIELD:
++   *
++   * Defined by metadata_format_identifier field.
++   *
++   * Since: 1.24
++   */
++  GST_MPEGTS_METADATA_FORMAT_IDENTIFIER_FIELD = 0xff
++} GstMpegtsMetadataFormat;
++
++
++/* MPEG-TS Metadata Descriptor (0x26) */
++typedef struct _GstMpegtsMetadataDescriptor GstMpegtsMetadataDescriptor;
++
++/**
++ * GstMpegtsMetadataDescriptor:
++ * @metadata_application_format: specifies the application responsible for defining usage, syntax and semantics
++ * @metadata_format: indicates the format and coding of the metadata
++ * @metadata_format_identifier: format identifier (equivalent to registration descriptor), for example 0x4B4C4641 ('KLVA') to indicate SMPTE 336 KLV.
++ * @metadata_service_id:  metadata service to which this metadata descriptor applies, typically 0x00
++ * @decoder_config_flags: decoder flags, see ISO/IEC 13818-1:2018 Table 2-88.
++ * @dsm_cc_flag: true if stream associated with this descriptor is in an ISO/IEC 13818-6 data or object carousel.
++ *
++ * The metadata descriptor specifies parameters of a metadata service carried in an MPEG-2 Transport Stream (or Program Stream). The descriptor is included in the PMT in the descriptor loop for the elementary stream that carries the
++metadata service. The descriptor specifies the format of the associated metadata, and contains the value of the
++metadata_service_id to identify the metadata service to which the metadata descriptor applies.
++ *
++ * Note that this structure does not include all of the metadata_descriptor items, and will need extension to support DSM-CC and private data.
++ * See ISO/IEC 13818-1:2018 Section 2.6.60 and Section 2.6.61 for more information.
++ *
++ * Since: 1.24
++ */
++struct _GstMpegtsMetadataDescriptor
++{
++  guint16 metadata_application_format;
++  GstMpegtsMetadataFormat metadata_format;
++  guint32 metadata_format_identifier;
++  guint8 metadata_service_id;
++  guint8 decoder_config_flags;
++  gboolean dsm_cc_flag;
++};
++
++/**
++ * GST_TYPE_MPEGTS_METADATA_DESCRIPTOR:
++ *
++ * metadata_descriptor type
++ *
++ * Since: 1.24
++ */
++#define GST_TYPE_MPEGTS_METADATA_DESCRIPTOR (gst_mpegts_metadata_descriptor_get_type ())
++
++GST_MPEGTS_API
++GType gst_mpegts_metadata_descriptor_get_type (void);
++
++G_END_DECLS
++
++#endif
+diff --git a/subprojects/gst-plugins-bad/gst-libs/gst/mpegts/gst-mpegtspesmetadatameta.c b/subprojects/gst-plugins-bad/gst-libs/gst/mpegts/gst-mpegtspesmetadatameta.c
+new file mode 100644
+index 00000000000..cc9ce3877e7
+--- /dev/null
++++ b/subprojects/gst-plugins-bad/gst-libs/gst/mpegts/gst-mpegtspesmetadatameta.c
+@@ -0,0 +1,106 @@
++/* Gstreamer
++ * Copyright 2021 Brad Hards <bradh@frogmouth.net>
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Library General Public
++ * License as published by the Free Software Foundation; either
++ * version 2 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Library General Public License for more details.
++ *
++ * You should have received a copy of the GNU Library General Public
++ * License along with this library; if not, write to the
++ * Free Software Foundation, Inc., 59 Temple Place - Suite 330,
++ * Boston, MA 02111-1307, USA.
++ */
++
++#ifdef HAVE_CONFIG_H
++#include "config.h"
++#endif
++
++#include "gst-mpegtspesmetadatameta.h"
++
++#define GST_CAT_DEFAULT mpegts_debug
++
++static gboolean
++gst_mpegts_pes_metadata_meta_init (GstMpegtsPESMetadataMeta * meta,
++    gpointer params, GstBuffer * buffer)
++{
++  return TRUE;
++}
++
++static void
++gst_mpegts_pes_metadata_meta_free (GstMpegtsPESMetadataMeta * meta,
++    GstBuffer * buffer)
++{
++}
++
++static gboolean
++gst_mpegts_pes_metadata_meta_transform (GstBuffer * dest, GstMeta * meta,
++    GstBuffer * buffer, GQuark type, gpointer data)
++{
++  GstMpegtsPESMetadataMeta *source_meta, *dest_meta;
++
++  source_meta = (GstMpegtsPESMetadataMeta *) meta;
++
++  if (GST_META_TRANSFORM_IS_COPY (type)) {
++    GstMetaTransformCopy *copy = data;
++    if (!copy->region) {
++      dest_meta = gst_buffer_add_mpegts_pes_metadata_meta (dest);
++      if (!dest_meta)
++        return FALSE;
++      dest_meta->metadata_service_id = source_meta->metadata_service_id;
++      dest_meta->flags = source_meta->flags;
++    }
++  } else {
++    /* return FALSE, if transform type is not supported */
++    return FALSE;
++  }
++  return TRUE;
++}
++
++GType
++gst_mpegts_pes_metadata_meta_api_get_type (void)
++{
++  static GType type;
++  static const gchar *tags[] = { NULL };
++
++  if (g_once_init_enter (&type)) {
++    GType _type =
++        gst_meta_api_type_register ("GstMpegtsPESMetadataMetaAPI", tags);
++    g_once_init_leave (&type, _type);
++  }
++  return type;
++}
++
++const GstMetaInfo *
++gst_mpegts_pes_metadata_meta_get_info (void)
++{
++  static const GstMetaInfo *mpegts_pes_metadata_meta_info = NULL;
++
++  if (g_once_init_enter ((GstMetaInfo **) & mpegts_pes_metadata_meta_info)) {
++    const GstMetaInfo *meta =
++        gst_meta_register (GST_MPEGTS_PES_METADATA_META_API_TYPE,
++        "GstMpegtsPESMetadataMeta", sizeof (GstMpegtsPESMetadataMeta),
++        (GstMetaInitFunction) gst_mpegts_pes_metadata_meta_init,
++        (GstMetaFreeFunction) gst_mpegts_pes_metadata_meta_free,
++        (GstMetaTransformFunction) gst_mpegts_pes_metadata_meta_transform);
++    g_once_init_leave ((GstMetaInfo **) & mpegts_pes_metadata_meta_info,
++        (GstMetaInfo *) meta);
++  }
++
++  return mpegts_pes_metadata_meta_info;
++}
++
++GstMpegtsPESMetadataMeta *
++gst_buffer_add_mpegts_pes_metadata_meta (GstBuffer * buffer)
++{
++  GstMpegtsPESMetadataMeta *meta;
++  meta =
++      (GstMpegtsPESMetadataMeta *) gst_buffer_add_meta (buffer,
++      GST_MPEGTS_PES_METADATA_META_INFO, NULL);
++  return meta;
++}
+diff --git a/subprojects/gst-plugins-bad/gst-libs/gst/mpegts/gst-mpegtspesmetadatameta.h b/subprojects/gst-plugins-bad/gst-libs/gst/mpegts/gst-mpegtspesmetadatameta.h
+new file mode 100644
+index 00000000000..3cb2afd53a0
+--- /dev/null
++++ b/subprojects/gst-plugins-bad/gst-libs/gst/mpegts/gst-mpegtspesmetadatameta.h
+@@ -0,0 +1,108 @@
++/* Gstreamer
++ * Copyright 2021,2023 Brad Hards <bradh@frogmouth.net>
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Library General Public
++ * License as published by the Free Software Foundation; either
++ * version 2 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Library General Public License for more details.
++ *
++ * You should have received a copy of the GNU Library General Public
++ * License along with this library; if not, write to the
++ * Free Software Foundation, Inc., 59 Temple Place - Suite 330,
++ * Boston, MA 02111-1307, USA.
++ */
++
++#ifndef __GST_MPEGTS_PES_METADATA_META_H__
++#define __GST_MPEGTS_PES_METADATA_META_H__
++
++#include <gst/gst.h>
++#include <gst/mpegts/mpegts-prelude.h>
++
++G_BEGIN_DECLS
++
++typedef struct _GstMpegtsPESMetadataMeta GstMpegtsPESMetadataMeta;
++
++/**
++ * gst_mpegts_pes_metadata_meta_api_get_type
++ *
++ * Return the #GType associated with #GstMpegtsPESMetadataMeta
++ *
++ * Returns: a #GType
++ *
++ * Since: 1.24
++ */
++GST_MPEGTS_API
++GType gst_mpegts_pes_metadata_meta_api_get_type (void);
++
++/**
++ * GST_MPEGTS_PES_METADATA_META_API_TYPE:
++ *
++ * The #GType associated with #GstMpegtsPESMetadataMeta.
++ *
++ * Since: 1.24
++ */
++#define GST_MPEGTS_PES_METADATA_META_API_TYPE  (gst_mpegts_pes_metadata_meta_api_get_type())
++
++/**
++ * GST_MPEGTS_PES_METADATA_META_INFO:
++ *
++ * The #GstMetaInfo associated with #GstMpegtsPESMetadataMeta.
++ *
++ * Since: 1.24
++ */
++#define GST_MPEGTS_PES_METADATA_META_INFO  (gst_mpegts_pes_metadata_meta_get_info())
++
++/**
++ * gst_mpegts_pes_metadata_meta_get_info:
++ *
++ * Gets the global #GstMetaInfo describing the #GstMpegtsPESMetadataMeta meta.
++ *
++ * Returns: (transfer none): The #GstMetaInfo
++ *
++ * Since: 1.24
++ */
++GST_MPEGTS_API
++const GstMetaInfo * gst_mpegts_pes_metadata_meta_get_info (void);
++
++/**
++ * GstMpegtsPESMetadataMeta:
++ * @meta: parent #GstMeta
++ * @metadata_service_id: metadata service identifier
++ * @flags: bit flags, see spec for details
++ *
++ * Extra buffer metadata describing the PES Metadata context.
++ * This is based on the Metadata AU cell header in
++ * ISO/IEC 13818-1:2018 Section 2.12.4.
++ *
++ * AU_cell_data_length is not provided, since it matches the length of the buffer
++ *
++ * Since: 1.24
++ */
++struct _GstMpegtsPESMetadataMeta {
++  GstMeta            meta;
++  guint8             metadata_service_id;
++  guint8             flags;
++};
++
++/**
++ * gst_buffer_add_mpegts_pes_metadata_meta:
++ * @buffer: a #GstBuffer
++ *
++ * Creates and adds a #GstMpegtsPESMetadataMeta to a @buffer.
++ *
++ * Returns: (transfer full): a newly created #GstMpegtsPESMetadataMeta
++ *
++ * Since: 1.24
++ */
++GST_MPEGTS_API
++GstMpegtsPESMetadataMeta *
++gst_buffer_add_mpegts_pes_metadata_meta (GstBuffer * buffer);
++
++G_END_DECLS
++
++#endif
+diff --git a/subprojects/gst-plugins-bad/gst-libs/gst/mpegts/gstmpegtsdescriptor.h b/subprojects/gst-plugins-bad/gst-libs/gst/mpegts/gstmpegtsdescriptor.h
+index 3e4d95d6c41..44782abbc79 100644
+--- a/subprojects/gst-plugins-bad/gst-libs/gst/mpegts/gstmpegtsdescriptor.h
++++ b/subprojects/gst-plugins-bad/gst-libs/gst/mpegts/gstmpegtsdescriptor.h
+@@ -32,6 +32,7 @@
+ #ifndef GST_MPEGTS_DESCRIPTOR_H
+ #define GST_MPEGTS_DESCRIPTOR_H
+ 
++#include "gst-metadata-descriptor.h"
+ #include <gst/gst.h>
+ #include <gst/mpegts/mpegts-prelude.h>
+ 
+@@ -343,7 +344,14 @@ guint gst_mpegts_descriptor_parse_iso_639_language_nb (const GstMpegtsDescriptor
+ GST_MPEGTS_API
+ GstMpegtsDescriptor * gst_mpegts_descriptor_from_iso_639_language (const gchar * language);
+ 
++GST_MPEGTS_API
++gboolean gst_mpegts_descriptor_parse_metadata (const GstMpegtsDescriptor *descriptor, GstMpegtsMetadataDescriptor **res);
+ 
++GST_MPEGTS_API
++gboolean gst_mpegts_descriptor_parse_metadata_std (const GstMpegtsDescriptor *descriptor,
++                                                   guint32 *metadata_input_leak_rate,
++                                                   guint32 *metadata_buffer_size,
++                                                   guint32 *metadata_output_leak_rate);
+ 
+ /* GST_MTS_DESC_DTG_LOGICAL_CHANNEL (0x83) */
+ typedef struct _GstMpegtsLogicalChannelDescriptor GstMpegtsLogicalChannelDescriptor;
+diff --git a/subprojects/gst-plugins-bad/gst-libs/gst/mpegts/meson.build b/subprojects/gst-plugins-bad/gst-libs/gst/mpegts/meson.build
+index 9cbe6ac70db..7a2b1531271 100644
+--- a/subprojects/gst-plugins-bad/gst-libs/gst/mpegts/meson.build
++++ b/subprojects/gst-plugins-bad/gst-libs/gst/mpegts/meson.build
+@@ -6,6 +6,8 @@ mpegts_sources = files(
+   'gst-dvb-section.c',
+   'gst-atsc-section.c',
+   'gst-scte-section.c',
++  'gst-mpegtspesmetadatameta.c',
++  'gst-metadata-descriptor.c'
+ )
+ 
+ mpegts_headers = files(
+@@ -18,6 +20,8 @@ mpegts_headers = files(
+   'gst-atsc-descriptor.h',
+   'gst-dvb-descriptor.h',
+   'gst-isdb-descriptor.h',
++  'gst-mpegtspesmetadatameta.h',
++  'gst-metadata-descriptor.h',
+   'mpegts-prelude.h',
+   'mpegts.h',
+ )
+diff --git a/subprojects/gst-plugins-bad/gst-libs/gst/mpegts/mpegts.h b/subprojects/gst-plugins-bad/gst-libs/gst/mpegts/mpegts.h
+index 80be35bb3b3..497ee364bb7 100644
+--- a/subprojects/gst-plugins-bad/gst-libs/gst/mpegts/mpegts.h
++++ b/subprojects/gst-plugins-bad/gst-libs/gst/mpegts/mpegts.h
+@@ -40,6 +40,7 @@
+ #include <gst/mpegts/gst-scte-section.h>
+ #include <gst/mpegts/gstmpegts-enumtypes.h>
+ #include <gst/mpegts/gst-hdmv-section.h>
++#include <gst/mpegts/gst-metadata-descriptor.h>
+ 
+ G_BEGIN_DECLS
+ 
+diff --git a/subprojects/gst-plugins-bad/gst/mpegtsdemux/tsdemux.c b/subprojects/gst-plugins-bad/gst/mpegtsdemux/tsdemux.c
+index e4e32427099..b0129262de3 100644
+--- a/subprojects/gst-plugins-bad/gst/mpegtsdemux/tsdemux.c
++++ b/subprojects/gst-plugins-bad/gst/mpegtsdemux/tsdemux.c
+@@ -44,6 +44,8 @@
+ #include "tsdemux.h"
+ #include "gstmpegdesc.h"
+ #include "gstmpegdefs.h"
++#include "gst/mpegts/gst-mpegtspesmetadatameta.h"
++#include "gst/mpegts/gst-metadata-descriptor.h"
+ #include "mpegtspacketizer.h"
+ #include "pesparse.h"
+ #include <gst/codecparsers/gsth264parser.h>
+@@ -61,6 +63,9 @@
+ #define CONTINUITY_UNSET 255
+ #define MAX_CONTINUITY 15
+ 
++/* Length of metadata_AU_cell header, see ISO/IEC 13818-1:2018 Section 2.12.4 */
++#define PES_PACKET_METADATA_AU_HEADER_LEN 5
++
+ /* Seeking/Scanning related variables */
+ 
+ /* seek to SEEK_TIMESTAMP_OFFSET before the desired offset and search then
+@@ -3305,6 +3310,74 @@ out:
+   return gst_buffer_new_wrapped (stream->data, stream->current_size);
+ }
+ 
++static GstBufferList *
++parse_pes_metadata_frame (TSDemuxStream * stream)
++{
++  GstByteReader reader;
++  GstBufferList *buffer_list = NULL;
++
++  buffer_list = gst_buffer_list_new ();
++  gst_byte_reader_init (&reader, stream->data, stream->current_size);
++
++  do {
++    GstBuffer *buffer;
++    GstMpegtsPESMetadataMeta *meta;
++    guint8 *au_data;
++    guint16 au_size;
++    guint8 service_id;
++    guint8 sequence_number;
++    guint8 flags;
++
++    if (gst_byte_reader_get_remaining (&reader) <
++        PES_PACKET_METADATA_AU_HEADER_LEN)
++      goto error;
++
++    if (!gst_byte_reader_get_uint8 (&reader, &service_id))
++      goto error;
++
++    if (!gst_byte_reader_get_uint8 (&reader, &sequence_number))
++      goto error;
++
++    if (!gst_byte_reader_get_uint8 (&reader, &flags))
++      goto error;
++
++    if (!gst_byte_reader_get_uint16_be (&reader, &au_size))
++      goto error;
++
++    if (gst_byte_reader_get_remaining (&reader) < au_size)
++      goto error;
++
++    if (!gst_byte_reader_dup_data (&reader, au_size, &au_data))
++      goto error;
++
++    buffer = gst_buffer_new_wrapped (au_data, au_size);
++    meta = gst_buffer_add_mpegts_pes_metadata_meta (buffer);
++    meta->metadata_service_id = service_id;
++    meta->flags = flags;
++    GST_DEBUG_OBJECT (stream->pad,
++        "metadata_service_id: 0x%02x, flags: 0x%02x, cell_data_length: 0x%04x",
++        meta->metadata_service_id, meta->flags, au_size);
++
++    gst_buffer_list_add (buffer_list, buffer);
++  } while (gst_byte_reader_get_remaining (&reader) > 0);
++
++  g_free (stream->data);
++  stream->data = NULL;
++  stream->current_size = 0;
++
++  return buffer_list;
++
++error:
++  {
++    GST_ERROR ("Failed to parse PES metadata access units");
++    g_free (stream->data);
++    stream->data = NULL;
++    stream->current_size = 0;
++    if (buffer_list)
++      gst_buffer_list_unref (buffer_list);
++    return NULL;
++  }
++}
+ 
+ static GstFlowReturn
+ gst_ts_demux_push_pending_data (GstTSDemux * demux, TSDemuxStream * stream,
+diff --git a/subprojects/gst-plugins-bad/tests/examples/mpegts/ts-parser.c b/subprojects/gst-plugins-bad/tests/examples/mpegts/ts-parser.c
+index b5714c8dd21..31f016a785c 100644
+--- a/subprojects/gst-plugins-bad/tests/examples/mpegts/ts-parser.c
++++ b/subprojects/gst-plugins-bad/tests/examples/mpegts/ts-parser.c
+@@ -31,6 +31,8 @@
+ #include <glib/gprintf.h>
+ #include <gst/gst.h>
+ #include <gst/mpegts/mpegts.h>
++#include <gst/mpegts/gst-metadata-descriptor.h>
++
+ #define MPEGTIME_TO_GSTTIME(t) ((t) * (guint64)100000 / 9)
+ 
+ static void
+@@ -779,6 +781,47 @@ dump_generic_descriptor (GstMpegtsDescriptor * desc, guint spacing)
+       }
+     }
+       break;
++    case GST_MTS_DESC_METADATA:
++    {
++      GstMpegtsMetadataDescriptor *metadataDescriptor;
++      if (gst_mpegts_descriptor_parse_metadata (desc, &metadataDescriptor)) {
++        g_printf ("%*s   metadata application format : 0x%04x\n", spacing, "",
++            metadataDescriptor->metadata_application_format);
++        g_printf ("%*s   metadata format             : 0x%02x\n", spacing, "",
++            metadataDescriptor->metadata_format);
++        if (metadataDescriptor->metadata_format ==
++            GST_MPEGTS_METADATA_FORMAT_IDENTIFIER_FIELD) {
++          g_printf ("%*s   metadata format identifier  : 0x%08x\n", spacing, "",
++              metadataDescriptor->metadata_format_identifier);
++        }
++        g_printf ("%*s   metadata service id         : 0x%02x\n", spacing, "",
++            metadataDescriptor->metadata_service_id);
++        g_printf ("%*s   decoder config flags        : 0x%x\n", spacing, "",
++            metadataDescriptor->decoder_config_flags);
++        g_printf ("%*s   DSM-CC flag                 : %s\n", spacing, "",
++            metadataDescriptor->dsm_cc_flag ? "Set" : "Not set");
++        g_free (metadataDescriptor);
++      }
++    }
++      break;
++    case GST_MTS_DESC_METADATA_STD:
++    {
++      guint32 metadata_input_leak_rate;
++      guint32 metadata_buffer_size;
++      guint32 metadata_output_leak_rate;
++
++      if (gst_mpegts_descriptor_parse_metadata_std (desc,
++              &metadata_input_leak_rate, &metadata_buffer_size,
++              &metadata_output_leak_rate)) {
++        g_printf ("%*s   metadata input leak rate  : %i\n", spacing, "",
++            metadata_input_leak_rate);
++        g_printf ("%*s   metadata buffer size      : %i\n", spacing, "",
++            metadata_buffer_size);
++        g_printf ("%*s   metadata output leak rate : %i\n", spacing, "",
++            metadata_output_leak_rate);
++      }
++    }
++      break;
+     default:
+       break;
+   }
+-- 
+GitLab
+
+
+From 6f2eb752c5e4b32650d8d0d2eaec063614efaa3e Mon Sep 17 00:00:00 2001
+From: Brad Hards <bradh@frogmouth.net>
+Date: Thu, 30 Mar 2023 20:09:59 +1100
+Subject: [PATCH 2/2] mpegts: add support for KLV metadata in PES packets
+
+Co-authored-by: Andoni Morales Alastruey <ylatuya@gmail.com>
+Part-of: <https://gitlab.freedesktop.org/gstreamer/gstreamer/-/merge_requests/1312>
+---
+ .../gst-plugins-bad/gst/mpegtsdemux/tsdemux.c | 55 +++++++++++++++----
+ 1 file changed, 43 insertions(+), 12 deletions(-)
+
+diff --git a/subprojects/gst-plugins-bad/gst/mpegtsdemux/tsdemux.c b/subprojects/gst-plugins-bad/gst/mpegtsdemux/tsdemux.c
+index b0129262de3..70d3afc52dd 100644
+--- a/subprojects/gst-plugins-bad/gst/mpegtsdemux/tsdemux.c
++++ b/subprojects/gst-plugins-bad/gst/mpegtsdemux/tsdemux.c
+@@ -1728,6 +1728,28 @@ create_pad_for_stream (MpegTSBase * base, MpegTSBaseStream * bstream,
+           "mpegversion", G_TYPE_INT, 4,
+           "systemstream", G_TYPE_BOOLEAN, FALSE, NULL);
+       break;
++    case GST_MPEGTS_STREAM_TYPE_METADATA_PES_PACKETS:
++      desc = mpegts_get_descriptor_from_stream (bstream, GST_MTS_DESC_METADATA);
++      if (desc) {
++        GstMpegtsMetadataDescriptor *metadataDescriptor;
++        if (gst_mpegts_descriptor_parse_metadata (desc, &metadataDescriptor)) {
++          if ((metadataDescriptor->metadata_format ==
++                  GST_MPEGTS_METADATA_FORMAT_IDENTIFIER_FIELD)
++              && (metadataDescriptor->metadata_format_identifier ==
++                  DRF_ID_KLVA)) {
++            sparse = TRUE;
++            is_private = TRUE;
++            /* registration_id is not correctly set or parsed for some streams */
++            bstream->registration_id = DRF_ID_KLVA;
++
++            caps = gst_caps_new_simple ("meta/x-klv",
++                "parsed", G_TYPE_BOOLEAN, TRUE,
++                "stream-type", G_TYPE_INT, bstream->stream_type, NULL);
++          }
++          g_free (metadataDescriptor);
++        }
++      }
++      break;
+     case GST_MPEGTS_STREAM_TYPE_VIDEO_H264:
+       is_video = TRUE;
+       caps = gst_caps_new_simple ("video/x-h264",
+@@ -3431,18 +3453,19 @@ gst_ts_demux_push_pending_data (GstTSDemux * demux, TSDemuxStream * stream,
+           res = GST_FLOW_ERROR;
+           goto beach;
+         }
+-
+-        if (gst_buffer_list_length (buffer_list) == 1) {
+-          buffer = gst_buffer_ref (gst_buffer_list_get (buffer_list, 0));
+-          gst_buffer_list_unref (buffer_list);
+-          buffer_list = NULL;
+-        }
+       } else if (bs->stream_type == GST_MPEGTS_STREAM_TYPE_VIDEO_JP2K) {
+         buffer = parse_jp2k_access_unit (stream);
+         if (!buffer) {
+           res = GST_FLOW_ERROR;
+           goto beach;
+         }
++      } else if (bs->stream_type == GST_MPEGTS_STREAM_TYPE_METADATA_PES_PACKETS
++          && bs->registration_id == DRF_ID_KLVA) {
++        buffer_list = parse_pes_metadata_frame (stream);
++        if (!buffer_list) {
++          res = GST_FLOW_ERROR;
++          goto beach;
++        }
+       } else {
+         buffer = gst_buffer_new_wrapped (stream->data, stream->current_size);
+       }
+@@ -3485,12 +3508,6 @@ gst_ts_demux_push_pending_data (GstTSDemux * demux, TSDemuxStream * stream,
+         res = GST_FLOW_ERROR;
+         goto beach;
+       }
+-
+-      if (gst_buffer_list_length (buffer_list) == 1) {
+-        buffer = gst_buffer_ref (gst_buffer_list_get (buffer_list, 0));
+-        gst_buffer_list_unref (buffer_list);
+-        buffer_list = NULL;
+-      }
+     } else if (bs->stream_type == GST_MPEGTS_STREAM_TYPE_VIDEO_JP2K) {
+       buffer = parse_jp2k_access_unit (stream);
+       if (!buffer) {
+@@ -3503,6 +3520,13 @@ gst_ts_demux_push_pending_data (GstTSDemux * demux, TSDemuxStream * stream,
+         res = GST_FLOW_ERROR;
+         goto beach;
+       }
++    } else if (bs->stream_type == GST_MPEGTS_STREAM_TYPE_METADATA_PES_PACKETS
++        && bs->registration_id == DRF_ID_KLVA) {
++      buffer_list = parse_pes_metadata_frame (stream);
++      if (!buffer_list) {
++        res = GST_FLOW_ERROR;
++        goto beach;
++      }
+     } else {
+       buffer = gst_buffer_new_wrapped (stream->data, stream->current_size);
+     }
+@@ -3535,6 +3559,13 @@ gst_ts_demux_push_pending_data (GstTSDemux * demux, TSDemuxStream * stream,
+     }
+   }
+ 
++
++  if (buffer_list != NULL && gst_buffer_list_length (buffer_list) == 1) {
++    buffer = gst_buffer_ref (gst_buffer_list_get (buffer_list, 0));
++    gst_buffer_list_unref (buffer_list);
++    buffer_list = NULL;
++  }
++
+   if (G_UNLIKELY (stream->need_newsegment))
+     calculate_and_push_newsegment (demux, stream, target_program);
+ 
+-- 
+GitLab
+
